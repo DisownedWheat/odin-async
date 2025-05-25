@@ -30,15 +30,16 @@ Scheduler_Thread :: struct {
 	current_task: ^Scheduler_Task,
 	own_thread:   ^thread.Thread,
 	scheduler:    ^Scheduler,
+	wg:           ^sync.Wait_Group,
 	lock:         sync.Mutex,
 	id:           int,
-	channel:      ^chan.Chan(Scheduler_Msg, .Send),
+	channel:      chan.Chan(Scheduler_Msg, .Send),
 }
 
 Scheduler :: struct {
 	threads:              [dynamic]^Scheduler_Thread,
-	// tasks_waiting:        [dynamic]^Scheduler_Task,
-	tasks_waiting:        queue.Queue(Scheduler_Task),
+	tasks_waiting:        queue.Queue(^Scheduler_Task),
+	max_threads:          int,
 	open_threads:         int,
 	own_thread:           ^thread.Thread,
 	max_tasks_per_thread: u32,
@@ -46,6 +47,7 @@ Scheduler :: struct {
 	lock:                 sync.Mutex,
 	task_id:              u64,
 	wg:                   sync.Wait_Group,
+	thread_wg:            ^sync.Wait_Group,
 	channel:              chan.Chan(Scheduler_Msg),
 	alive:                bool,
 }
@@ -62,7 +64,16 @@ Scheduler_Task :: struct {
 push_task :: proc(scheduler: ^Scheduler, task: ^Scheduler_Task) {
 	task.id = scheduler.task_id
 	scheduler.task_id += 1
-	queue.push_back(&scheduler.tasks_waiting, task^)
+	queue.push_back(&scheduler.tasks_waiting, task)
+}
+
+@(private)
+pop_task :: proc(scheduler: ^Scheduler) -> (^Scheduler_Task, bool) {
+	sync.lock(&scheduler.lock)
+	defer sync.unlock(&scheduler.lock)
+	next, ok := queue.pop_front_safe(&scheduler.tasks_waiting)
+
+	return next, ok
 }
 
 task_await :: proc(parent: Schedule_Parent, process: Task_Process) -> Scheduler_Error {
@@ -119,6 +130,7 @@ task_spawn :: proc(parent: Schedule_Parent, process: Task_Process) -> Scheduler_
 		sync.lock(&scheduler.lock)
 		defer sync.unlock(&scheduler.lock)
 		push_task(scheduler, new_task)
+		chan.send(scheduler.channel, Task_Added{})
 	case ^Scheduler:
 		scheduler := t
 
@@ -128,10 +140,13 @@ task_spawn :: proc(parent: Schedule_Parent, process: Task_Process) -> Scheduler_
 
 		new_task := new(Scheduler_Task, scheduler.allocator)
 		new_task.process = process
+		fmt.println("New task created", new_task)
 
 		sync.lock(&scheduler.lock)
 		defer sync.unlock(&scheduler.lock)
 		push_task(scheduler, new_task)
+
+		chan.send(scheduler.channel, Task_Added{})
 	}
 	return nil
 }
@@ -144,15 +159,18 @@ worker_thread :: proc(t: ^thread.Thread) {
 	defer sync.wait_group_done(&scheduler.wg)
 
 	for {
-		sync.lock(&state.lock)
-		task, ok := queue.pop_front_safe(&state.tasks)
-		sync.unlock(&state.lock)
+		fmt.println("Worker thread running...")
+		sync.cond_wait(&state.wg.cond, &state.lock)
+		task, ok := pop_task(scheduler)
 		if !ok {
-			chan.send(state.channel^, Worker_Complete{id = state.id})
+			chan.send(state.channel, Worker_Complete{id = state.id})
 			return
 		}
-		defer free(task)
 		task.process(task, task.data)
+		if task.wg != nil {
+			sync.wait_group_done(task.wg)
+		}
+		chan.send(state.channel, Task_Complete{})
 	}
 }
 
@@ -188,19 +206,81 @@ scheduler_free :: proc(scheduler: ^Scheduler) {
 }
 
 @(private)
-schedule_process :: proc(data: ^thread.Thread) {
+scheduler_process :: proc(data: ^thread.Thread) {
+	fmt.println("Starting scheduler rocess thread")
 	scheduler: ^Scheduler
 	scheduler = (^Scheduler)(data.data)
 	defer sync.wait_group_wait(&scheduler.wg)
+	fmt.println("SCHEDULER THREADS", scheduler.threads)
+
+	first_run_flag := true
 
 	for {
-		log.info("Waiting msg...")
-		msg, ok := chan.recv(scheduler.channel)
+
+		if first_run_flag {
+			first_run_flag = false
+			sync.wait_group_done(&scheduler.wg)
+		}
+
+		// log.info("Waiting msg...")
+		fmt.println("Waiting msg")
+		chan_msg, ok := chan.recv(scheduler.channel)
 		if !ok {
 			break
 		}
+		fmt.println("Got a message!")
 		sync.lock(&scheduler.lock)
 		defer sync.unlock(&scheduler.lock)
+
+		fmt.println("Here now", chan_msg)
+		fmt.println(scheduler.threads)
+
+		switch msg in chan_msg {
+		case Task_Added:
+			fmt.println("Task has been added", scheduler.threads[:])
+			sync.cond_signal(&scheduler.thread_wg.cond)
+		// new_thread_needed := true
+		// for t in scheduler.threads[:] {
+		// 	sync.lock(&t.lock)
+		// 	defer sync.unlock(&t.lock)
+		//
+		// 	if queue.len(t.tasks) >= int(scheduler.max_tasks_per_thread) {
+		// 		continue
+		// 	}
+		// 	new_thread_needed = false
+		// }
+		//
+		// fmt.println(
+		// 	"New thread needed:",
+		// 	new_thread_needed,
+		// 	len(scheduler.threads),
+		// 	scheduler.max_threads,
+		// )
+		//
+		// if new_thread_needed && len(scheduler.threads) < scheduler.max_threads {
+		// 	worker_t := thread.create(worker_thread)
+		// 	worker := new(Scheduler_Thread, scheduler.allocator)
+		// 	worker.own_thread = worker_t
+		// 	worker.scheduler = scheduler
+		// 	worker.lock = sync.Mutex{}
+		// 	worker.channel = chan.as_send(scheduler.channel)
+		//
+		// 	queue_backer := new([10]^Scheduler_Task)
+		// 	queue.init_from_slice(&worker.tasks, queue_backer[:])
+		//
+		// 	append(&scheduler.threads, worker)
+		//
+		// 	thread.start(worker.own_thread)
+		// }
+		case Shutdown:
+			break
+		case Task_Complete:
+			fmt.println("Task complete, yay!")
+		case Worker_Complete:
+			fmt.println("Worker has finished")
+		case:
+			fmt.println("Something went wrong...")
+		}
 	}
 }
 
@@ -212,38 +292,65 @@ scheduler_init :: proc(
 	Scheduler,
 	mem.Allocator_Error,
 ) {
-	fmt.println("Starting")
-	lock: sync.Mutex
-	scheduler, scheduler_err := new(Scheduler)
-	fmt.println("Scheduler created")
-	if scheduler_err != nil {
-		return scheduler^, scheduler_err
-	}
+	scheduler := Scheduler{}
 
 	max_threads := thread_count.? or_else os.processor_core_count()
-	threads := make([dynamic]^Scheduler_Thread, allocator)
-	reserve_err := reserve(&threads, max_threads)
+	threads, reserve_err := make([dynamic]^Scheduler_Thread, allocator)
 	if reserve_err != nil {
-		return scheduler^, reserve_err
+		return scheduler, reserve_err
 	}
 
-	scheduler.threads = threads
+	thread_wg := new(sync.Wait_Group, allocator)
+	for i in 0 ..< max_threads {
+		fmt.println("Creating thread...")
+		worker_t := thread.create(worker_thread)
+		worker := new(Scheduler_Thread, scheduler.allocator)
+		worker.own_thread = worker_t
+		worker.scheduler = &scheduler
+		worker.lock = sync.Mutex{}
+		worker.channel = chan.as_send(scheduler.channel)
+		worker.wg = thread_wg
+
+		queue_backer := new([10]^Scheduler_Task)
+		queue.init_from_slice(&worker.tasks, queue_backer[:])
+
+		append(&scheduler.threads, worker)
+
+		append(&threads, worker)
+	}
+
 	scheduler.open_threads = 0
 	scheduler.max_tasks_per_thread = max_tasks_per_thread
 	scheduler.alive = true
+	scheduler.lock = sync.Mutex{}
+	scheduler.allocator = allocator
+	scheduler.wg = sync.Wait_Group{}
+	scheduler.max_threads = max_threads
+	scheduler.thread_wg = thread_wg
 
 	channel, err := chan.create_buffered(chan.Chan(Scheduler_Msg), max_threads * 2, allocator)
 	if err != nil {
-		return scheduler^, err
+		return scheduler, err
 	}
 	scheduler.channel = channel
+	fmt.println("Channel created")
 
-	own_thread := thread.create(schedule_process)
+	own_thread := thread.create(scheduler_process)
 	own_thread.data = &scheduler
 	scheduler.own_thread = own_thread
 
-	initial_task := Scheduler_Task{}
+	sync.wait_group_add(&scheduler.wg, 1)
 
 	thread.start(own_thread)
-	return scheduler^, nil
+
+	fmt.println("Waiting")
+	sync.wait_group_wait(&scheduler.wg)
+	fmt.println("DONE")
+
+	for t in threads {
+		thread.start(t.own_thread)
+	}
+
+
+	return scheduler, nil
 }

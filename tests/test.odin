@@ -8,11 +8,12 @@ import "core:time"
 
 @(test)
 test_init :: proc(t: ^testing.T) {
-	fmt.println(context.allocator)
-	s, err := task.scheduler_init(nil, context.allocator)
+	log.debug("Starting test")
+	s, err := task.scheduler_init(nil)
 	if err != nil {
 		testing.fail(t)
 	}
+	fmt.println("Starting task?")
 	task.task_spawn(&s, test_inner_proc)
 	task.scheduler_join(&s)
 }
